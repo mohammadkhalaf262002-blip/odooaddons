@@ -33,7 +33,6 @@
                         <group>
                             <field name="excel_file" filename="excel_filename" widget="binary"/>
                             <field name="excel_filename" invisible="1"/>
-                            <field name="webhook_url"/>
                         </group>
                         <group>
                             <field name="search_date" readonly="1"/>
@@ -108,7 +107,7 @@
                             </group>
                             <div class="alert alert-info" role="alert" invisible="not is_scheduled">
                                 <strong>Note:</strong> Scheduled searches will run automatically at the specified time.
-                                Make sure the n8n workflow is running and accessible.
+                                Make sure the SerpAPI key is configured in System Parameters (totaline.serpapi_key).
                             </div>
                         </page>
                     </notebook>

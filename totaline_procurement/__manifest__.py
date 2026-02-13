@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Totaline Procurement',
-    'version': '18.0.2.0.0',
+    'version': '18.0.3.0.0',
     'category': 'Purchase',
     'summary': 'Price Comparison Tool for Procurement',
     'description': """
@@ -13,7 +13,8 @@
         Features:
         ---------
         * Upload Excel file with product list
-        * Search prices from multiple stores
+        * Direct SerpAPI integration (no n8n dependency)
+        * Smart filtering with Turkish product matching
         * Compare up to 3 prices per product
         * Create Purchase Orders from results
         * Price history tracking with analytics
