@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Main Menu Item -->
+    <menuitem
+        id="menu_totaline_root"
+        name="Totaline"
+        sequence="25"
+        web_icon="totaline_procurement,static/description/icon.png"
+    />
+
+    <!-- Price Comparison Submenu -->
+    <menuitem
+        id="menu_totaline_price_search"
+        name="Price Comparison"
+        parent="menu_totaline_root"
+        action="action_totaline_price_search"
+        sequence="10"
+    />
+
+    <!-- Settings Submenu (for future) -->
+    <menuitem
+        id="menu_totaline_config"
+        name="Configuration"
+        parent="menu_totaline_root"
+        sequence="100"
+        groups="base.group_system"
+    />
+
+</odoo>

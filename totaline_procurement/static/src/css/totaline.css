@@ -1,0 +1,47 @@
+/* Totaline Procurement Styles */
+
+/* Highlight best price */
+.o_list_table .text-success.fw-bold {
+    color: #28a745 !important;
+    font-weight: 700 !important;
+}
+
+/* Warning styling */
+.o_list_table .text-warning {
+    color: #ffc107 !important;
+}
+
+/* Price totals cards */
+.totaline-total-card {
+    padding: 15px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+}
+
+.totaline-total-best {
+    background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+    color: #000;
+}
+
+.totaline-total-second {
+    background: linear-gradient(135deg, #00d9ff 0%, #0099cc 100%);
+    color: #000;
+}
+
+.totaline-total-third {
+    background: linear-gradient(135deg, #ff9f43 0%, #ee5a24 100%);
+    color: #fff;
+}
+
+/* Status badges */
+.o_field_badge[data-value="done"] {
+    background-color: #28a745 !important;
+}
+
+.o_field_badge[data-value="searching"] {
+    background-color: #17a2b8 !important;
+}
+
+.o_field_badge[data-value="error"] {
+    background-color: #dc3545 !important;
+}

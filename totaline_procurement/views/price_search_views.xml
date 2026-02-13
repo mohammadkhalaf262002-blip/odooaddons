@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Price Search Form View -->
+    <record id="view_totaline_price_search_form" model="ir.ui.view">
+        <field name="name">totaline.price.search.form</field>
+        <field name="model">totaline.price.search</field>
+        <field name="arch" type="xml">
+            <form string="Price Search">
+                <header>
+                    <button name="action_search_prices" string="Search Prices" type="object" class="btn-primary" invisible="state != 'draft'"/>
+                    <button name="action_search_prices" string="Search Again" type="object" invisible="state not in ('done', 'error')"/>
+                    <button name="action_reset_draft" string="Reset" type="object" invisible="state == 'draft'"/>
+                    <button name="action_create_purchase_order" string="Create Purchase Order" type="object" class="btn-success" invisible="state != 'done'"/>
+                    <field name="state" widget="statusbar" statusbar_visible="draft,searching,done"/>
+                </header>
+                <sheet>
+                    <div class="oe_button_box" name="button_box">
+                        <button class="oe_stat_button" icon="fa-shopping-cart" type="object" name="action_create_purchase_order" invisible="state != 'done'">
+                            <field name="product_count" string="Products" widget="statinfo"/>
+                        </button>
+                        <button class="oe_stat_button" icon="fa-history" type="object" name="action_view_price_history">
+                            <span class="o_stat_text">Price History</span>
+                        </button>
+                    </div>
+                    <div class="oe_title">
+                        <h1>
+                            <field name="name" placeholder="Search Name"/>
+                        </h1>
+                    </div>
+
+                    <group>
+                        <group>
+                            <field name="excel_file" filename="excel_filename" widget="binary"/>
+                            <field name="excel_filename" invisible="1"/>
+                            <field name="webhook_url"/>
+                        </group>
+                        <group>
+                            <field name="search_date" readonly="1"/>
+                            <field name="error_message" readonly="1" invisible="not error_message" class="text-danger"/>
+                        </group>
+                    </group>
+
+                    <!-- Totals Summary -->
+                    <group string="Price Totals" invisible="state != 'done'">
+                        <group>
+                            <field name="total_best_price" widget="monetary" options="{'currency_field': 'currency_id'}" class="text-success fw-bold"/>
+                        </group>
+                        <group>
+                            <field name="total_second_price" widget="monetary"/>
+                        </group>
+                        <group>
+                            <field name="total_third_price" widget="monetary"/>
+                        </group>
+                    </group>
+
+                    <notebook>
+                        <page string="Products &amp; Results" name="products">
+                            <field name="search_line_ids">
+                                <list editable="bottom">
+                                    <field name="sequence" widget="handle"/>
+                                    <field name="product_name"/>
+                                    <field name="brand"/>
+                                    <field name="quantity"/>
+                                    <field name="unit"/>
+                                    <field name="description"/>
+                                    <field name="product_id" string="Odoo Ürün" optional="hide"/>
+                                    <field name="price_1" string="1. Fiyat" class="text-success fw-bold"/>
+                                    <field name="store_link_1" string="1. Mağaza"/>
+                                    <field name="price_2" string="2. Fiyat"/>
+                                    <field name="store_link_2" string="2. Mağaza"/>
+                                    <field name="price_diff_percent" string="% Fark"/>
+                                    <field name="price_3" string="3. Fiyat"/>
+                                    <field name="store_link_3" string="3. Mağaza"/>
+                                    <field name="selected_price" string="Seçim"/>
+                                    <field name="warning" class="text-warning"/>
+                                </list>
+                            </field>
+                        </page>
+                        <page string="Seçim Detayları" name="selection_details">
+                            <group string="Seçilen Fiyatlar Özeti">
+                                <p>Her ürün için PO'da kullanılacak fiyatı seçebilirsiniz. Varsayılan olarak en iyi fiyat (1. Fiyat) seçilidir.</p>
+                            </group>
+                            <field name="search_line_ids" readonly="1">
+                                <list>
+                                    <field name="product_name"/>
+                                    <field name="brand"/>
+                                    <field name="quantity"/>
+                                    <field name="selected_price" string="Seçilen"/>
+                                    <field name="selected_price_value" string="Seçilen Fiyat"/>
+                                    <field name="selected_store_value" string="Seçilen Mağaza"/>
+                                </list>
+                            </field>
+                        </page>
+                        <page string="Scheduled Search" name="scheduling">
+                            <group>
+                                <group string="Schedule Settings">
+                                    <field name="is_scheduled"/>
+                                    <field name="schedule_frequency" invisible="not is_scheduled"/>
+                                    <field name="schedule_time" widget="float_time" invisible="not is_scheduled"/>
+                                    <field name="schedule_day" invisible="not is_scheduled or schedule_frequency != 'weekly'"/>
+                                    <field name="schedule_day_of_month" invisible="not is_scheduled or schedule_frequency != 'monthly'"/>
+                                </group>
+                                <group string="Schedule Info" invisible="not is_scheduled">
+                                    <field name="next_scheduled_date" readonly="1"/>
+                                    <field name="last_scheduled_run" readonly="1"/>
+                                </group>
+                            </group>
+                            <div class="alert alert-info" role="alert" invisible="not is_scheduled">
+                                <strong>Note:</strong> Scheduled searches will run automatically at the specified time.
+                                Make sure the n8n workflow is running and accessible.
+                            </div>
+                        </page>
+                    </notebook>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+
+    <!-- Price Search List View -->
+    <record id="view_totaline_price_search_list" model="ir.ui.view">
+        <field name="name">totaline.price.search.list</field>
+        <field name="model">totaline.price.search</field>
+        <field name="arch" type="xml">
+            <list string="Price Searches">
+                <field name="name"/>
+                <field name="search_date"/>
+                <field name="product_count"/>
+                <field name="total_best_price" string="Best Total"/>
+                <field name="is_scheduled" string="Scheduled"/>
+                <field name="next_scheduled_date" string="Next Run" optional="show"/>
+                <field name="state" widget="badge" decoration-success="state == 'done'" decoration-info="state == 'searching'" decoration-danger="state == 'error'"/>
+            </list>
+        </field>
+    </record>
+
+    <!-- Price Search Action -->
+    <record id="action_totaline_price_search" model="ir.actions.act_window">
+        <field name="name">Price Search</field>
+        <field name="res_model">totaline.price.search</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                Start a new price search!
+            </p>
+            <p>
+                Upload an Excel file with your product list and search for the best prices across Turkish e-commerce stores.
+            </p>
+        </field>
+    </record>
+
+    <!-- Price History List View -->
+    <record id="view_totaline_price_history_list" model="ir.ui.view">
+        <field name="name">totaline.price.history.list</field>
+        <field name="model">totaline.price.history</field>
+        <field name="arch" type="xml">
+            <list string="Price History">
+                <field name="search_date"/>
+                <field name="product_name"/>
+                <field name="brand"/>
+                <field name="quantity"/>
+                <field name="unit"/>
+                <field name="price_1" string="Best Price"/>
+                <field name="store_1" string="Store"/>
+                <field name="price_2" string="2nd Price" optional="show"/>
+                <field name="store_2" string="2nd Store" optional="hide"/>
+                <field name="price_3" string="3rd Price" optional="hide"/>
+                <field name="price_per_unit" string="Price/Unit"/>
+            </list>
+        </field>
+    </record>
+
+    <!-- Price History Graph View -->
+    <record id="view_totaline_price_history_graph" model="ir.ui.view">
+        <field name="name">totaline.price.history.graph</field>
+        <field name="model">totaline.price.history</field>
+        <field name="arch" type="xml">
+            <graph string="Price History" type="line">
+                <field name="search_date" type="col"/>
+                <field name="price_1" type="measure"/>
+            </graph>
+        </field>
+    </record>
+
+    <!-- Price History Pivot View -->
+    <record id="view_totaline_price_history_pivot" model="ir.ui.view">
+        <field name="name">totaline.price.history.pivot</field>
+        <field name="model">totaline.price.history</field>
+        <field name="arch" type="xml">
+            <pivot string="Price History">
+                <field name="product_name" type="row"/>
+                <field name="search_date" type="col" interval="week"/>
+                <field name="price_1" type="measure"/>
+                <field name="price_per_unit" type="measure"/>
+            </pivot>
+        </field>
+    </record>
+
+    <!-- Price History Search View -->
+    <record id="view_totaline_price_history_search" model="ir.ui.view">
+        <field name="name">totaline.price.history.search</field>
+        <field name="model">totaline.price.history</field>
+        <field name="arch" type="xml">
+            <search string="Price History">
+                <field name="product_name"/>
+                <field name="brand"/>
+                <field name="store_1"/>
+                <filter name="this_week" string="This Week" domain="[('search_date', '>=', (context_today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d'))]"/>
+                <filter name="this_month" string="This Month" domain="[('search_date', '>=', (context_today().replace(day=1)).strftime('%Y-%m-%d'))]"/>
+                <group expand="0" string="Group By">
+                    <filter name="group_product" string="Product" context="{'group_by': 'product_name'}"/>
+                    <filter name="group_brand" string="Brand" context="{'group_by': 'brand'}"/>
+                    <filter name="group_store" string="Store" context="{'group_by': 'store_1'}"/>
+                    <filter name="group_date" string="Date" context="{'group_by': 'search_date:day'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- Price History Action -->
+    <record id="action_totaline_price_history" model="ir.actions.act_window">
+        <field name="name">Price History</field>
+        <field name="res_model">totaline.price.history</field>
+        <field name="view_mode">list,graph,pivot</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                No price history yet.
+            </p>
+            <p>
+                Price history will be recorded automatically when you run price searches.
+            </p>
+        </field>
+    </record>
+
+    <!-- Add Price History to Menu -->
+    <menuitem id="menu_totaline_price_history"
+              name="Price History"
+              parent="menu_totaline_root"
+              action="action_totaline_price_history"
+              sequence="20"/>
+
+</odoo>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Cron job for scheduled price searches -->
+    <record id="ir_cron_scheduled_price_search" model="ir.cron">
+        <field name="name">Totaline: Run Scheduled Price Searches</field>
+        <field name="model_id" ref="model_totaline_price_search"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_run_scheduled_searches()</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">hours</field>
+        <field name="active">True</field>
+    </record>
+
+</odoo>
