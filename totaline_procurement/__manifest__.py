@@ -29,8 +29,8 @@
     ],
     'data': [
         'security/ir.model.access.csv',
-        'views/menu_views.xml',
         'views/price_search_views.xml',
+        'views/menu_views.xml',
         'data/cron_data.xml',
     ],
     'assets': {

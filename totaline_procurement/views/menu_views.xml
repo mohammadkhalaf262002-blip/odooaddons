@@ -6,9 +6,9 @@
         id="menu_totaline_root"
         name="Totaline"
         sequence="25"
-        web_icon="totaline_procurement,static/description/icon.png"
-    />
 
+    />
+      <!-- web_icon="totaline_procurement,static/description/icon.png" -->
     <!-- Price Comparison Submenu -->
     <menuitem
         id="menu_totaline_price_search"
@@ -26,5 +26,12 @@
         sequence="100"
         groups="base.group_system"
     />
+
+    <menuitem id="menu_totaline_price_history"
+              name="Price History"
+              parent="menu_totaline_root"
+              action="action_totaline_price_history"
+              sequence="20"/>
+
 
 </odoo>

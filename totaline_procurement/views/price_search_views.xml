@@ -234,10 +234,5 @@
     </record>
 
     <!-- Add Price History to Menu -->
-    <menuitem id="menu_totaline_price_history"
-              name="Price History"
-              parent="menu_totaline_root"
-              action="action_totaline_price_history"
-              sequence="20"/>
 
 </odoo>
