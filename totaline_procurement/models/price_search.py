@@ -656,7 +656,9 @@ class TotalinePriceSearch(models.Model):
                 continue
 
             source = item.get('source', 'Unknown')
-            link = item.get('link', '')
+            # SerpAPI Google Shopping: 'link' is usually empty,
+            # 'product_link' has the Google Shopping product page URL
+            link = item.get('product_link', '') or item.get('link', '')
 
             if price <= 0:
                 continue
