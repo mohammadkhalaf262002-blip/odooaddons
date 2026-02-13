@@ -621,10 +621,37 @@ class TotalinePriceSearch(models.Model):
 
             if response.status_code == 200:
                 return response.json()
+            elif response.status_code == 429:
+                _logger.error('SerpAPI rate limit exceeded (429)')
+                raise UserError(
+                    'SerpAPI arama limiti aşıldı (429 Too Many Requests).\n\n'
+                    'Lütfen birkaç dakika bekleyip tekrar deneyin.\n'
+                    'Eğer ücretsiz plan kullanıyorsanız, günlük/aylık kotanızı kontrol edin:\n'
+                    'https://serpapi.com/manage-api-key'
+                )
+            elif response.status_code == 401:
+                _logger.error('SerpAPI authentication failed (401)')
+                raise UserError(
+                    'SerpAPI API anahtarı geçersiz (401 Unauthorized).\n\n'
+                    'Lütfen API anahtarınızı kontrol edin:\n'
+                    'Ayarlar → Teknik → Sistem Parametreleri → totaline.serpapi_key'
+                )
+            elif response.status_code == 403:
+                _logger.error('SerpAPI quota exhausted (403)')
+                raise UserError(
+                    'SerpAPI arama kotası tükendi (403 Forbidden).\n\n'
+                    'Ücretsiz arama hakkınız bitmiş olabilir.\n'
+                    'Yeni bir API anahtarı girin veya planınızı yükseltin:\n'
+                    'https://serpapi.com/manage-api-key\n\n'
+                    'Anahtarı değiştirmek için:\n'
+                    'Ayarlar → Teknik → Sistem Parametreleri → totaline.serpapi_key'
+                )
             else:
                 _logger.warning(f'SerpAPI returned status {response.status_code}: {response.text[:200]}')
                 return {}
 
+        except UserError:
+            raise
         except requests.exceptions.Timeout:
             _logger.warning(f'SerpAPI timeout for query: {search_query}')
             return {}
