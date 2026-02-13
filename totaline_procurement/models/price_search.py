@@ -249,7 +249,7 @@ def extract_quantity_from_title(title, unit, product_name):
         # Turkish: 10'lu, 8'li
         {'pattern': r"(\d+)\s*['\u00b4\u2018\u2019`]\s*l[iiuu]", 'name': 'Turkish apostrophe'},
         # Turkish without apostrophe: 10lu, 8li (but NOT after + sign)
-        {'pattern': r'(?<!\+\s?)(\d+)\s*l[iiuu](?:\s|$|,|\)|paket|koli|set|kutu)', 'name': 'Turkish no apostrophe'},
+        {'pattern': r'(?<!\+)(?<!\+ )(\d+)\s*l[iiuu](?:\s|$|,|\)|paket|koli|set|kutu)', 'name': 'Turkish no apostrophe'},
         # "N adet" standalone
         {'pattern': r'(?:^|\s)(\d+)\s*adet(?:\s|$|,|\))', 'name': 'N adet'},
         # Tablet/Capsule
