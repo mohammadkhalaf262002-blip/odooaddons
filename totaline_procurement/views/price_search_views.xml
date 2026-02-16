@@ -43,10 +43,10 @@
                     <!-- Totals Summary -->
                     <group string="Price Totals" invisible="state != 'done'">
                         <group>
-                            <field name="total_best_price" widget="monetary" options="{'currency_field': 'currency_id'}" class="text-success fw-bold"/>
+                            <field name="total_best_price" class="text-success fw-bold"/>
                         </group>
                         <group>
-                            <field name="total_second_price" widget="monetary"/>
+                            <field name="total_second_price"/>
                         </group>
                         <group>
                             <field name="total_third_price" widget="monetary"/>
