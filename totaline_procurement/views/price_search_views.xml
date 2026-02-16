@@ -49,7 +49,7 @@
                             <field name="total_second_price"/>
                         </group>
                         <group>
-                            <field name="total_third_price" widget="monetary"/>
+                            <field name="total_third_price"/>
                         </group>
                     </group>
 
