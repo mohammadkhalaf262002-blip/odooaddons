@@ -12,6 +12,7 @@
                     <button name="action_search_prices" string="Search Again" type="object" invisible="state not in ('done', 'error')"/>
                     <button name="action_reset_draft" string="Reset" type="object" invisible="state == 'draft'"/>
                     <button name="action_create_purchase_order" string="Create Purchase Order" type="object" class="btn-success" invisible="state != 'done'"/>
+                    <button name="action_export_template" string="Export Template" type="object" class="btn-secondary" icon="fa-download"/>
                     <field name="state" widget="statusbar" statusbar_visible="draft,searching,done"/>
                 </header>
                 <sheet>
@@ -33,6 +34,8 @@
                         <group>
                             <field name="excel_file" filename="excel_filename" widget="binary"/>
                             <field name="excel_filename" invisible="1"/>
+                            <field name="excel_sheet_name" invisible="not excel_sheet_names" placeholder="Select sheet..."/>
+                            <field name="excel_sheet_names" invisible="1"/>
                         </group>
                         <group>
                             <field name="search_date" readonly="1"/>
@@ -60,34 +63,40 @@
                                     <field name="sequence" widget="handle"/>
                                     <field name="product_name"/>
                                     <field name="brand"/>
-                                    <field name="quantity"/>
+                                    <field name="package_quantity" string="Pkg Qty" optional="show"/>
+                                    <field name="items_per_package" string="Items/Pkg" optional="show"/>
+                                    <field name="total_quantity" string="Total Qty" optional="show"/>
+                                    <field name="quantity" optional="hide"/>
                                     <field name="unit"/>
                                     <field name="description"/>
-                                    <field name="product_id" string="Odoo Ürün" optional="hide"/>
-                                    <field name="price_1" string="1. Fiyat" class="text-success fw-bold"/>
-                                    <field name="store_link_1" string="1. Mağaza"/>
-                                    <field name="price_2" string="2. Fiyat"/>
-                                    <field name="store_link_2" string="2. Mağaza"/>
-                                    <field name="price_diff_percent" string="% Fark"/>
-                                    <field name="price_3" string="3. Fiyat"/>
-                                    <field name="store_link_3" string="3. Mağaza"/>
-                                    <field name="selected_price" string="Seçim"/>
+                                    <field name="product_id" string="Odoo Product" optional="hide"/>
+                                    <field name="price_1" string="1st Price"/>
+                                    <field name="total_cost_1" string="Total Cost" class="text-success fw-bold"/>
+                                    <field name="store_link_1" string="1st Store"/>
+                                    <field name="price_2" string="2nd Price" optional="show"/>
+                                    <field name="total_cost_2" string="2nd Total" optional="hide"/>
+                                    <field name="store_link_2" string="2nd Store"/>
+                                    <field name="price_diff_percent" string="% Diff"/>
+                                    <field name="price_3" string="3rd Price"/>
+                                    <field name="store_link_3" string="3rd Store"/>
+                                    <field name="selected_price" string="Selection"/>
                                     <field name="warning" class="text-warning"/>
+                                    <button name="action_suggest_optimization" string="Optimize" type="object" icon="fa-magic" class="btn-link" title="Suggest optimal package combination"/>
                                 </list>
                             </field>
                         </page>
-                        <page string="Seçim Detayları" name="selection_details">
-                            <group string="Seçilen Fiyatlar Özeti">
-                                <p>Her ürün için PO'da kullanılacak fiyatı seçebilirsiniz. Varsayılan olarak en iyi fiyat (1. Fiyat) seçilidir.</p>
+                        <page string="Selection Details" name="selection_details">
+                            <group string="Selected Prices Summary">
+                                <p>You can select which price to use for the Purchase Order for each product. By default, the best price (1st Price) is selected.</p>
                             </group>
                             <field name="search_line_ids" readonly="1">
                                 <list>
                                     <field name="product_name"/>
                                     <field name="brand"/>
                                     <field name="quantity"/>
-                                    <field name="selected_price" string="Seçilen"/>
-                                    <field name="selected_price_value" string="Seçilen Fiyat"/>
-                                    <field name="selected_store_value" string="Seçilen Mağaza"/>
+                                    <field name="selected_price" string="Selected"/>
+                                    <field name="selected_price_value" string="Selected Price"/>
+                                    <field name="selected_store_value" string="Selected Store"/>
                                 </list>
                             </field>
                         </page>

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
-    'name': 'Totalien Procurement',
-    'version': '18.0.3.0.0',
+    'name': 'Totaline Procurement',
+    'version': '18.0.6.0.0',
     'category': 'Purchase',
     'summary': 'Price Comparison Tool for Procurement',
     'description': """
@@ -19,6 +19,10 @@
         * Create Purchase Orders from results
         * Price history tracking with analytics
         * Scheduled automatic price searches
+        * Excel template export with instructions
+        * Multi-sheet Excel import support
+        * Package/unit quantity breakdown with optimization
+        * Improved price accuracy with dual-query search
     """,
     'author': 'Totaline',
     'license': 'LGPL-3',

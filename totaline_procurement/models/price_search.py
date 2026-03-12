@@ -8,6 +8,7 @@ import re
 import math
 import base64
 import logging
+from difflib import SequenceMatcher
 import io
 
 _logger = logging.getLogger(__name__)
@@ -33,6 +34,9 @@ TRUSTED_STORES = [
     "teknosa", "mediamarkt", "vatan", "getir", "istegelsin",
     "rossmann", "eve", "flo", "boyner", "lcw", "defacto",
     "walmart", "costco", "sanalmarket", "marketpaketi", "happy center",
+    # B2B / Wholesale platforms
+    "toptancidan", "toptan perakende", "toptanburada", "uygunmarket",
+    "cimri", "akakce", "epey",
 ]
 
 ACCESSORY_KEYWORDS = [
@@ -53,6 +57,14 @@ GENERIC_PRODUCT_NAMES = [
     'rulo pecete', 'rulo pecete', 'kagit havlu', 'kagit havlu',
     'pecete', 'pecete', 'havlu',
 ]
+
+# Map generic product names to better search terms
+# "Rulo Peçete" is colloquial — "kağıt havlu" is what Google Shopping indexes
+GENERIC_NAME_MAP = {
+    'rulo pecete': 'kağıt havlu',
+    'kagit havlu': 'kağıt havlu',
+    'havlu': 'kağıt havlu',
+}
 
 # Product keyword categories for relevance checking
 PRODUCT_KEYWORDS = {
@@ -98,6 +110,122 @@ def normalize_turkish(text):
     return result
 
 
+def fuzzy_brand_match(brand_word, title_words, threshold=0.75):
+    """Check if brand_word fuzzy-matches any word in title_words."""
+    for tw in title_words:
+        if len(tw) < 2:
+            continue
+        # Exact substring (fast path)
+        if brand_word in tw or tw in brand_word:
+            return True
+        # Fuzzy match for words of similar length
+        if abs(len(brand_word) - len(tw)) <= 2:
+            ratio = SequenceMatcher(None, brand_word, tw).ratio()
+            if ratio >= threshold:
+                return True
+    return False
+
+
+def clean_description(description):
+    """Clean description text for use in search queries.
+    Removes parenthetical math, calculation expressions, and noise.
+    """
+    if not description:
+        return ''
+    text = description.strip()
+    # Remove parenthetical expressions containing math: (15 aket 15*8=120 adet)
+    text = re.sub(r'\([^)]*[*=+/][^)]*\)', '', text)
+    # Remove standalone math expressions: 15*8=120
+    text = re.sub(r'\d+\s*[*x]\s*\d+\s*=\s*\d+', '', text)
+    # Remove "Toplam" (total) expressions: (3kg Toplam), 3kg toplam, 3kg (Toplam: 6kg)
+    text = re.sub(r'\(?[\d.,]+\s*(?:gr|g|kg|ml|lt|l)\s*\(?[Tt]oplam[^)]*\)?', '', text, flags=re.IGNORECASE)
+    # Remove size + parenthetical with Toplam: "3kg (Toplam)" "3kg (Toplam: 6kg)"
+    text = re.sub(r'[\d.,]+\s*(?:gr|g|kg|ml|lt|l)\s*\([^)]*[Tt]oplam[^)]*\)', '', text, flags=re.IGNORECASE)
+    # Remove isolated "toptan", "fiyat", "toplam"
+    text = re.sub(r'\b(?:toptan|fiyat|toplam)\b', '', text, flags=re.IGNORECASE)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def extract_per_unit_size(description):
+    """Extract the per-unit size from a description, preferring individual
+    unit sizes over total/aggregate sizes.
+    Examples:
+        "250 Gram x 8 paket = 2Kg" -> "250 Gram"
+        "3kg Toplam"               -> None (total, skip)
+        "675 ml"                   -> "675 ml"
+    """
+    if not description:
+        return None
+    size_pattern = r'(\d+(?:[.,]\d+)?)\s*(gr|gram|g|kg|kgr|ml|lt|l|litre)\b'
+    matches = list(re.finditer(size_pattern, description, re.IGNORECASE))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        # If the single match is explicitly a total, skip it
+        start = max(0, matches[0].start() - 20)
+        end = min(len(description), matches[0].end() + 20)
+        context = description[start:end].lower()
+        if 'toplam' in context:
+            return None
+        return matches[0].group(0)
+    # Multiple sizes: check for multiplication/total patterns
+    has_multiply = bool(re.search(r'\d+\s*(?:gr|g|kg|ml|lt|l)\s*[x*]\s*\d+', description, re.IGNORECASE))
+    has_total = bool(re.search(r'[=]\s*\d+\s*(?:gr|g|kg|ml|lt|l)', description, re.IGNORECASE))
+    has_toplam = bool(re.search(r'toplam', description, re.IGNORECASE))
+    if has_multiply or has_total:
+        # Multiplication/equals formula found — return smallest (per-unit) size
+        def to_base_unit(value_str, unit_str):
+            val = float(value_str.replace(',', '.'))
+            u = unit_str.lower()
+            if u in ('kg', 'kgr', 'lt', 'l', 'litre'):
+                return val * 1000
+            return val
+        sized = []
+        for m in matches:
+            base = to_base_unit(m.group(1), m.group(2))
+            sized.append((base, m.group(0)))
+        sized.sort(key=lambda x: x[0])
+        return sized[0][1]  # Return the smallest (per-unit)
+    elif has_toplam:
+        # "Toplam" label without formula — return size OUTSIDE the Toplam parenthetical
+        # e.g. "3kg (Toplam 6kg)" → return "3kg" (outside), skip "6kg" (inside Toplam)
+        toplam_paren = re.search(r'\([^)]*[Tt]oplam[^)]*\)', description)
+        if toplam_paren:
+            non_toplam = [m for m in matches
+                          if not (m.start() >= toplam_paren.start() and m.end() <= toplam_paren.end())]
+            if non_toplam:
+                return non_toplam[0].group(0)
+        return None
+    # No multiplication pattern — return the first match
+    return matches[0].group(0)
+
+
+def extract_items_per_pkg(description):
+    """Extract items-per-package count from description pack patterns.
+
+    Matches Turkish pack-size suffixes like "8li", "12'li", "4'lü", "6'lı".
+    These indicate how many individual items are INSIDE each package.
+
+    Examples:
+        "Havlu 8li (15 paket 15*8=120 adet)" -> 8
+        "Çaykur Altınbaş 500gr"              -> 0 (no pack pattern)
+        "250 Gram x 8 paket = 2Kg"           -> 0 (no 'li pattern)
+    """
+    if not description:
+        return 0
+    # Match patterns: 8li, 8'li, 12'li, 4'lü, 6'lı, 4'lu (Turkish vowel harmony)
+    # Uses double-quoted raw string to avoid apostrophe escaping issues
+    match = re.search(r"(\d+)\s*'?l[iıüu]", description, re.IGNORECASE)
+    if match:
+        items = int(match.group(1))
+        # Sanity check: items per package should be 2-100
+        if 2 <= items <= 100:
+            return items
+    return 0
+
+
 def is_trusted_store(source):
     """Check if a store is in the trusted stores list."""
     if not source:
@@ -132,10 +260,11 @@ def is_relevant_product(title, searched_name, searched_brand):
     normalized_name = normalize_turkish(searched_name)
     normalized_brand = normalize_turkish(searched_brand)
 
-    # Must contain the brand (if specified)
+    # Must contain the brand (if specified) — fuzzy match allowed
     if normalized_brand and len(normalized_brand) > 2:
         brand_words = [w for w in normalized_brand.split() if len(w) > 2]
-        brand_match = any(word in normalized_title for word in brand_words)
+        title_words = normalized_title.split()
+        brand_match = any(fuzzy_brand_match(bw, title_words) for bw in brand_words)
         if not brand_match:
             return False
 
@@ -258,6 +387,10 @@ def extract_quantity_from_title(title, unit, product_name):
         {'pattern': r'(\d+)\s*(?:rulo|roll)', 'name': 'Rulo'},
     ]
 
+    # Non-count unit words: when a number is followed by these, it's a measurement NOT a pack count
+    # "200 yaprak" = 200 sheets (per roll), "500 ml" = volume, "250 gr" = weight
+    NON_COUNT_UNITS = {'yaprak', 'sayfa', 'ml', 'gr', 'gram', 'kg', 'lt', 'litre', 'cm', 'mm', 'm', 'metre'}
+
     for pp in pack_patterns:
         match = re.search(pp['pattern'], original_title, re.IGNORECASE)
         if not match:
@@ -265,9 +398,26 @@ def extract_quantity_from_title(title, unit, product_name):
         if match:
             qty = int(match.group(1))
             if 2 <= qty <= 500:
+                # Check if this number is actually a measurement, not a pack count
+                # Look at the broader context around the match
+                match_end = match.end()
+                search_text = original_title if match.string == original_title else normalized_title
+                after_match = search_text[match_end:match_end + 15].strip().lower()
+                # Also check what comes after the number itself (before the pattern suffix)
+                num_str = str(qty)
+                num_pos = search_text.lower().find(num_str)
+                if num_pos >= 0:
+                    after_num = search_text[num_pos + len(num_str):num_pos + len(num_str) + 12].strip().lower()
+                    first_word_after = after_num.split()[0] if after_num.split() else ''
+                    if normalize_turkish(first_word_after) in NON_COUNT_UNITS:
+                        # This is a measurement (e.g., "200 yaprak"), not a pack count — skip
+                        continue
                 return {'qty': qty, 'confident': True, 'pattern_used': pp['name']}
 
-    return {'qty': detected_qty, 'confident': confident}
+    # No quantity pattern found → this is a single item.
+    # Treat as confident qty=1 so single items compete fairly with
+    # multi-packs in per-unit-price sorting (prevents over-purchase bias).
+    return {'qty': 1, 'confident': True, 'pattern_used': 'single_item_default'}
 
 
 def calculate_relevance_score(title, source, original_name, original_brand):
@@ -296,13 +446,11 @@ def calculate_relevance_score(title, source, original_name, original_brand):
         elif name_match_ratio < 1:
             score -= 20
 
-    # Check if brand matches
+    # Check if brand matches (fuzzy)
     if normalized_brand and len(normalized_brand) > 2:
-        brand_words = normalized_brand.split()
-        brand_match = any(
-            len(word) > 2 and word in normalized_title
-            for word in brand_words
-        )
+        brand_words = [w for w in normalized_brand.split() if len(w) > 2]
+        title_words = normalized_title.split()
+        brand_match = any(fuzzy_brand_match(bw, title_words) for bw in brand_words)
         if not brand_match:
             score -= 35
 
@@ -316,20 +464,21 @@ def calculate_relevance_score(title, source, original_name, original_brand):
     bulk_indicators = ['toptan', 'koli', 'set', 'paket', 'x 50', 'x50', '50 adet']
     for indicator in bulk_indicators:
         if normalize_turkish(indicator) in normalized_title:
-            score += 15
+            score += 25
             break
 
     # Bonus for trusted stores
     if is_trusted_store(source):
-        score += 10
+        score += 20
 
     return max(0, score)
 
 
-def build_search_query(product_name, brand, description, unit, quantity):
+def build_search_query(product_name, brand, description, unit, quantity, include_quantity=True):
     """
     Build an optimized search query for Google Shopping.
-    Ported from n8n Parse Products node.
+    No longer appends 'toptan' or 'fiyat' — these biased results toward
+    bulk industrial listings with inflated prices.
     """
     name = (product_name or '').strip()
     brand = (brand or '').strip()
@@ -341,37 +490,61 @@ def build_search_query(product_name, brand, description, unit, quantity):
 
     # Check if this is a generic product that needs description-based search
     use_description = False
+    matched_generic = None
     for generic in GENERIC_PRODUCT_NAMES:
         if normalize_turkish(generic) in name_lower and description:
             use_description = True
+            matched_generic = generic
             break
 
     if use_description:
-        search_query = f"{description} {brand}".strip()
+        cleaned_desc = clean_description(description)
+        # Use mapped search term if available (e.g., "Rulo Peçete" → "kağıt havlu")
+        # This uses Google Shopping's indexed terms instead of colloquial names
+        mapped_name = GENERIC_NAME_MAP.get(matched_generic, name)
+        # Remove words from description that are already in the mapped name
+        # e.g., mapped "kağıt havlu" + desc "Havlu 8li" → "kağıt havlu 8li" (no dup)
+        mapped_words = set(normalize_turkish(mapped_name).split())
+        desc_parts = [w for w in cleaned_desc.split()
+                      if normalize_turkish(w) not in mapped_words]
+        unique_desc = ' '.join(desc_parts)
+        search_query = f"{mapped_name} {unique_desc} {brand}".strip()
     else:
         search_query = f"{name} {brand}".strip()
 
-    # Add unit context for bulk searches
-    if quantity > 1:
-        unit_context_map = {
-            'kg': 'kg toptan',
-            'litre': 'litre toptan',
-            'lt': 'litre toptan',
-            'koli': 'koli toptan',
-            'paket': 'paket',
-            'adet': 'toptan',
-        }
-        context = unit_context_map.get(unit, 'toptan')
-        search_query += f" {context}"
+    # Add unit hint (not 'adet') for non-count units like kg, paket, litre
+    if include_quantity and unit and unit not in ('adet',):
+        search_query += f" {unit}"
 
-    # Extract size hints from description
+    # Extract per-unit size first (needed to decide on quantity hint)
+    per_unit_size = None
     if description:
-        size_match = re.search(r'(\d+)\s*(?:gr|g|kg|ml|lt|l)\b', description, re.IGNORECASE)
-        if size_match and size_match.group(0).lower() not in search_query.lower():
-            search_query += f" {size_match.group(0)}"
+        per_unit_size = extract_per_unit_size(description)
 
-    # Add "fiyat" to help Google Shopping results
-    search_query += " fiyat"
+    # Check if description already has a pack-size pattern like "8li", "4lü", "12'li"
+    # If so, don't add order quantity as 'li — description already specifies pack size
+    # e.g. "Havlu 8li" — "8li" IS the pack size, qty=15 is order count (NOT a pack size)
+    desc_has_pack_hint = bool(re.search(r"\d+['\u2019]?l[i\u0131\u00fc\u00fcu]", description or '', re.IGNORECASE))
+
+    # Add pack-size hints based on quantity
+    if include_quantity and quantity:
+        qty_int = int(quantity)
+        if desc_has_pack_hint:
+            # Description already specifies pack size (e.g., "8li") — skip order qty hint
+            pass
+        elif 6 <= qty_int <= 24:
+            # Large multi-packs: always add quantity hint
+            search_query += f" {qty_int}'li"
+        elif 2 <= qty_int <= 5 and not per_unit_size:
+            # Small quantities: add qty hint only when no size info found
+            # e.g. Islak Mendil qty=4 (no size) → "4'li"
+            # e.g. Pril qty=4 (675 ml) → no hint (size already in query)
+            # e.g. Peros qty=2 (3kg) → no hint (size already in query)
+            search_query += f" {qty_int}'li"
+
+    # Append per-unit size if found and not already in query
+    if per_unit_size and per_unit_size.lower() not in search_query.lower():
+        search_query += f" {per_unit_size}"
 
     return search_query.strip()
 
@@ -397,21 +570,74 @@ class TotalinePriceSearch(models.Model):
     # Excel Upload
     excel_file = fields.Binary(string='Excel File', attachment=True)
     excel_filename = fields.Char(string='Filename')
+    excel_sheet_name = fields.Char(string='Sheet Name',
+                                    help='Select which sheet to import from')
+    excel_sheet_names = fields.Char(string='Available Sheets', readonly=True,
+                                     help='Comma-separated list of sheet names')
+
+    @api.onchange('excel_sheet_name')
+    def _onchange_excel_sheet_name(self):
+        """Re-parse Excel when a different sheet is selected."""
+        if self.excel_file and self.excel_sheet_name:
+            self._parse_excel_sheet(self.excel_sheet_name)
 
     @api.onchange('excel_file')
     def _onchange_excel_file(self):
         """Parse Excel file when uploaded and populate product lines"""
         if not self.excel_file:
+            self.excel_sheet_names = False
+            self.excel_sheet_name = False
             return
 
         if not OPENPYXL_AVAILABLE:
             raise UserError('Excel parsing library (openpyxl) is not installed.')
 
         try:
-            # Decode base64 file
+            file_content = base64.b64decode(self.excel_file)
+            workbook = openpyxl.load_workbook(io.BytesIO(file_content), read_only=True)
+            sheet_names = workbook.sheetnames
+            workbook.close()
+
+            if len(sheet_names) > 1:
+                # Multiple sheets: show selection and wait
+                self.excel_sheet_names = ', '.join(sheet_names)
+                self.excel_sheet_name = sheet_names[0]  # Default to first
+                self._parse_excel_sheet(sheet_names[0])
+                return {
+                    'type': 'ir.actions.client',
+                    'tag': 'display_notification',
+                    'params': {
+                        'title': 'Multiple Sheets Detected',
+                        'message': f'Found {len(sheet_names)} sheets: {", ".join(sheet_names)}. '
+                                   f'Loaded "{sheet_names[0]}". Change the Sheet Name field to switch.',
+                        'type': 'warning',
+                        'sticky': True,
+                    }
+                }
+            else:
+                self.excel_sheet_names = False
+                self.excel_sheet_name = False
+                self._parse_excel_sheet(sheet_names[0] if sheet_names else None)
+
+        except UserError:
+            raise
+        except Exception as e:
+            _logger.exception('Failed to parse Excel file')
+            raise UserError(f'Failed to parse Excel file: {str(e)}')
+
+    def _parse_excel_sheet(self, sheet_name=None):
+        """Parse a specific sheet from the uploaded Excel file."""
+        if not self.excel_file:
+            return
+
+        try:
             file_content = base64.b64decode(self.excel_file)
             workbook = openpyxl.load_workbook(io.BytesIO(file_content))
-            sheet = workbook.active
+
+            if sheet_name and sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+            else:
+                sheet = workbook.active
 
             # Clear existing lines
             self.search_line_ids = [(5, 0, 0)]
@@ -430,6 +656,8 @@ class TotalinePriceSearch(models.Model):
                 'quantity': ['miktar', 'quantity', 'qty', 'adet'],
                 'unit': ['birim', 'unit'],
                 'description': ['a\u00e7\u0131klama', 'aciklama', 'description', 'desc', 'detay'],
+                'package_quantity': ['package qty', 'package quantity', 'paket adedi', 'paket miktar'],
+                'items_per_package': ['items per package', 'items/pkg', 'paket icerigi', 'paket ici adet'],
             }
 
             # Find column indices
@@ -478,25 +706,39 @@ class TotalinePriceSearch(models.Model):
                     val = sheet.cell(row=row_idx, column=col_indices['description']).value
                     line_data['description'] = str(val).strip() if val else ''
 
+                if 'package_quantity' in col_indices:
+                    val = sheet.cell(row=row_idx, column=col_indices['package_quantity']).value
+                    try:
+                        line_data['package_quantity'] = float(val) if val else 1
+                    except (ValueError, TypeError):
+                        line_data['package_quantity'] = 1
+
+                if 'items_per_package' in col_indices:
+                    val = sheet.cell(row=row_idx, column=col_indices['items_per_package']).value
+                    try:
+                        line_data['items_per_package'] = float(val) if val else 1
+                    except (ValueError, TypeError):
+                        line_data['items_per_package'] = 1
+
+                # Sync: if package fields were provided, compute quantity from them
+                pkg_qty = line_data.get('package_quantity', 1)
+                items_pkg = line_data.get('items_per_package', 1)
+                if pkg_qty > 1 or items_pkg > 1:
+                    line_data['quantity'] = pkg_qty * items_pkg
+                elif line_data.get('quantity', 1) > 1 and 'package_quantity' not in col_indices:
+                    # Excel only has Miktar (quantity), no package columns:
+                    # put quantity into package_quantity so it shows in the UI
+                    line_data['package_quantity'] = line_data['quantity']
+
                 lines.append((0, 0, line_data))
 
             self.search_line_ids = lines
-
-            return {
-                'type': 'ir.actions.client',
-                'tag': 'display_notification',
-                'params': {
-                    'title': 'Excel Imported',
-                    'message': f'{len(lines)} products loaded successfully.',
-                    'type': 'success',
-                    'sticky': False,
-                }
-            }
+            _logger.info(f'Parsed {len(lines)} products from sheet "{sheet_name or "active"}"')
 
         except UserError:
             raise
         except Exception as e:
-            _logger.exception('Failed to parse Excel file')
+            _logger.exception('Failed to parse Excel sheet')
             raise UserError(f'Failed to parse Excel file: {str(e)}')
 
     # Results
@@ -577,12 +819,12 @@ class TotalinePriceSearch(models.Model):
         for record in self:
             record.product_count = len(record.search_line_ids)
 
-    @api.depends('search_line_ids.price_1', 'search_line_ids.price_2', 'search_line_ids.price_3')
+    @api.depends('search_line_ids.total_cost_1', 'search_line_ids.total_cost_2', 'search_line_ids.total_cost_3')
     def _compute_totals(self):
         for record in self:
-            record.total_best_price = sum(line.price_1 or 0 for line in record.search_line_ids)
-            record.total_second_price = sum(line.price_2 or 0 for line in record.search_line_ids)
-            record.total_third_price = sum(line.price_3 or 0 for line in record.search_line_ids)
+            record.total_best_price = sum(line.total_cost_1 or 0 for line in record.search_line_ids)
+            record.total_second_price = sum(line.total_cost_2 or 0 for line in record.search_line_ids)
+            record.total_third_price = sum(line.total_cost_3 or 0 for line in record.search_line_ids)
 
     # ============================================
     # SERPAPI DIRECT INTEGRATION
@@ -624,27 +866,27 @@ class TotalinePriceSearch(models.Model):
             elif response.status_code == 429:
                 _logger.error('SerpAPI rate limit exceeded (429)')
                 raise UserError(
-                    'SerpAPI arama limiti aşıldı (429 Too Many Requests).\n\n'
-                    'Lütfen birkaç dakika bekleyip tekrar deneyin.\n'
-                    'Eğer ücretsiz plan kullanıyorsanız, günlük/aylık kotanızı kontrol edin:\n'
+                    'SerpAPI rate limit exceeded (429 Too Many Requests).\n\n'
+                    'Please wait a few minutes and try again.\n'
+                    'If you are on a free plan, check your daily/monthly quota:\n'
                     'https://serpapi.com/manage-api-key'
                 )
             elif response.status_code == 401:
                 _logger.error('SerpAPI authentication failed (401)')
                 raise UserError(
-                    'SerpAPI API anahtarı geçersiz (401 Unauthorized).\n\n'
-                    'Lütfen API anahtarınızı kontrol edin:\n'
-                    'Ayarlar → Teknik → Sistem Parametreleri → totaline.serpapi_key'
+                    'SerpAPI API key is invalid (401 Unauthorized).\n\n'
+                    'Please check your API key:\n'
+                    'Settings → Technical → System Parameters → totaline.serpapi_key'
                 )
             elif response.status_code == 403:
                 _logger.error('SerpAPI quota exhausted (403)')
                 raise UserError(
-                    'SerpAPI arama kotası tükendi (403 Forbidden).\n\n'
-                    'Ücretsiz arama hakkınız bitmiş olabilir.\n'
-                    'Yeni bir API anahtarı girin veya planınızı yükseltin:\n'
+                    'SerpAPI search quota exhausted (403 Forbidden).\n\n'
+                    'Your free search credits may have run out.\n'
+                    'Enter a new API key or upgrade your plan:\n'
                     'https://serpapi.com/manage-api-key\n\n'
-                    'Anahtarı değiştirmek için:\n'
-                    'Ayarlar → Teknik → Sistem Parametreleri → totaline.serpapi_key'
+                    'To change the key:\n'
+                    'Settings → Technical → System Parameters → totaline.serpapi_key'
                 )
             else:
                 _logger.warning(f'SerpAPI returned status {response.status_code}: {response.text[:200]}')
@@ -659,10 +901,220 @@ class TotalinePriceSearch(models.Model):
             _logger.exception(f'SerpAPI request failed: {e}')
             return {}
 
-    def _format_search_results(self, serp_results, product_name, brand, quantity, unit, description):
+    def _search_serpapi_immersive(self, page_token, api_key):
+        """
+        Call SerpAPI google_immersive_product engine to get verified store offers.
+
+        This is Step 2 of the two-step search:
+        Step 1: google_shopping → find the best matching product (with page_token)
+        Step 2: google_immersive_product → get verified multi-seller offers with
+                real prices, shipping costs, and direct store links.
+
+        Returns raw JSON response or empty dict on failure.
+        """
+        params = {
+            'engine': 'google_immersive_product',
+            'page_token': page_token,
+            'api_key': api_key,
+        }
+
+        try:
+            response = requests.get(
+                'https://serpapi.com/search.json',
+                params=params,
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                product_info = data.get('product_results', {})
+                # Sellers can be under product_results.stores (Turkish) or sellers_results.online_sellers
+                stores = product_info.get('stores', [])
+                sellers_online = data.get('sellers_results', {}).get('online_sellers', []) if not stores else []
+                seller_count = len(stores or sellers_online)
+                _logger.info(
+                    f'Immersive product: {seller_count} offers for '
+                    f'"{product_info.get("title", "unknown")}"'
+                )
+                return data
+            else:
+                _logger.warning(f'SerpAPI immersive product returned status {response.status_code}')
+                return {}
+
+        except Exception as e:
+            _logger.warning(f'SerpAPI immersive product request failed: {e}')
+            return {}
+
+    def _format_immersive_results(self, immersive_data, product_name, brand, quantity, unit, shopping_detected_qty=1):
+        """
+        Format immersive product store offers into the standard price result dict.
+
+        The immersive product API returns verified offers from multiple stores
+        for ONE specific product. Each store has: price, shipping, total, direct link.
+
+        Args:
+            immersive_data: Raw response from google_immersive_product
+            product_name: Original product name from Excel
+            brand: Original brand from Excel
+            quantity: Order quantity needed
+            unit: Unit type (adet, paket, etc.)
+            shopping_detected_qty: Quantity detected from the shopping result title
+                                   (the product that led to this immersive lookup)
+
+        Returns:
+            Formatted result dict (same structure as _format_search_results)
+            or None if no valid offers found.
+        """
+        product_info = immersive_data.get('product_results', {})
+
+        # Extract sellers from multiple possible response paths
+        # SerpAPI structures this differently by locale/product type
+        sellers = []
+
+        # Path 1: product_results.stores (Turkish locale — confirmed working)
+        sellers = product_info.get('stores', [])
+
+        # Path 2: sellers_results.online_sellers (English locale / other product types)
+        if not sellers:
+            sellers_results = immersive_data.get('sellers_results', {})
+            if isinstance(sellers_results, dict):
+                sellers = sellers_results.get('online_sellers', [])
+
+        # Path 3: Direct online_sellers at root level
+        if not sellers:
+            sellers = immersive_data.get('online_sellers', [])
+
+        # Path 4: Other possible keys inside product_results
+        if not sellers:
+            sellers = product_info.get('sellers', []) or product_info.get('online_sellers', [])
+
+        if not sellers:
+            _logger.info(f'No sellers found in immersive product for "{product_name}"')
+            return None
+
+        original_qty = int(quantity or 1)
+        original_unit = (unit or 'adet').lower()
+        verified_title = product_info.get('title', '')
+        verified_brand = product_info.get('brand', '')
+
+        # Process each seller offer
+        processed = []
+        for seller in sellers:
+            # Extract price — try multiple field names
+            price = 0
+            try:
+                price = float(
+                    seller.get('extracted_price', 0) or
+                    seller.get('base_price_extracted', 0) or
+                    0
+                )
+            except (ValueError, TypeError):
+                continue
+
+            if price <= 0:
+                continue
+
+            # Extract shipping cost
+            shipping = 0
+            try:
+                shipping = float(seller.get('shipping_extracted', 0) or 0)
+            except (ValueError, TypeError):
+                shipping = 0
+
+            # Total price (price + shipping)
+            total = 0
+            try:
+                total = float(seller.get('extracted_total', 0) or 0)
+            except (ValueError, TypeError):
+                total = 0
+            if total <= 0:
+                total = price + shipping
+
+            store_name = seller.get('name', seller.get('source', 'Unknown'))
+            link = seller.get('link', '')
+            tag = seller.get('tag', '')
+            trusted = is_trusted_store(store_name)
+
+            processed.append({
+                'source': store_name,
+                'link': link,
+                'price': price,
+                'shipping': shipping,
+                'total': total,
+                'tag': tag,
+                'trusted': trusted,
+            })
+
+        if not processed:
+            _logger.info(f'No valid seller prices in immersive product for "{product_name}"')
+            return None
+
+        # Sort: trusted stores first, then by total price (including shipping)
+        processed.sort(key=lambda s: (not s['trusted'], s['total']))
+
+        top_3 = processed[:3]
+
+        # Use the detected_qty from the shopping result that led us here
+        detected_qty = shopping_detected_qty or 1
+
+        # Calculate cost to fulfill for the warning
+        if detected_qty >= 1 and original_qty > 0:
+            packs_needed = math.ceil(original_qty / detected_qty)
+        else:
+            packs_needed = original_qty
+
+        # Build result dict (same structure as _format_search_results)
+        result = {
+            'price_1': top_3[0]['price'] if len(top_3) > 0 else 0,
+            'store_1': top_3[0]['source'] if len(top_3) > 0 else '',
+            'url_1': top_3[0]['link'] if len(top_3) > 0 else '',
+            'price_2': top_3[1]['price'] if len(top_3) > 1 else 0,
+            'store_2': top_3[1]['source'] if len(top_3) > 1 else '',
+            'url_2': top_3[1]['link'] if len(top_3) > 1 else '',
+            'price_3': top_3[2]['price'] if len(top_3) > 2 else 0,
+            'store_3': top_3[2]['source'] if len(top_3) > 2 else '',
+            'url_3': top_3[2]['link'] if len(top_3) > 2 else '',
+            # All stores sell the SAME product → same detected quantity
+            'detected_qty_1': detected_qty,
+            'detected_qty_2': detected_qty,
+            'detected_qty_3': detected_qty,
+            'warning': '',
+        }
+
+        # Build informative warning with verification + shipping info
+        warnings = []
+
+        # Show verified product title (proves we found the right product)
+        if verified_title:
+            short_title = verified_title[:60] + ('...' if len(verified_title) > 60 else '')
+            warnings.append(f"✓ {short_title}")
+
+        # Show shipping cost for best offer
+        if top_3[0].get('shipping', 0) > 0:
+            warnings.append(f"+₺{top_3[0]['shipping']:.0f} kargo")
+
+        # Show tag if present (e.g., "En iyi fiyat", "En popüler")
+        if top_3[0].get('tag'):
+            warnings.append(top_3[0]['tag'])
+
+        # Show pack info if multi-pack
+        if detected_qty > 1 and original_qty > 1:
+            warnings.append(f"{detected_qty}'li paket → {packs_needed}x sipariş")
+
+        result['warning'] = ' | '.join(warnings) if warnings else ''
+
+        best_shipping = top_3[0].get('shipping', 0)
+        shipping_info = f' (+₺{best_shipping:.0f} kargo)' if best_shipping > 0 else ''
+        _logger.info(
+            f'Immersive results for "{product_name}": '
+            f'{len(processed)} sellers, best: ₺{result["price_1"]:.0f} at {result["store_1"]}{shipping_info}'
+        )
+
+        return result
+
+    def _format_search_results(self, serp_results, product_name, brand, quantity, unit, description, relevance_threshold=40):
         """
         Process SerpAPI results and return top 3 price results.
-        Ported from n8n Format Response V3 node.
 
         Returns dict with: price_1, store_1, url_1, price_2, ..., price_3, ..., warning
         """
@@ -686,6 +1138,8 @@ class TotalinePriceSearch(models.Model):
             # SerpAPI Google Shopping: 'link' is usually empty,
             # 'product_link' has the Google Shopping product page URL
             link = item.get('product_link', '') or item.get('link', '')
+            # Immersive product page token for two-step verified search
+            page_token = item.get('immersive_product_page_token', '')
 
             if price <= 0:
                 continue
@@ -702,46 +1156,77 @@ class TotalinePriceSearch(models.Model):
             detected_qty = quantity_info.get('qty', 1)
             confident = quantity_info.get('confident', False)
 
-            # Calculate multiplier
-            multiplier = 1
+            # Calculate per-unit price for sorting
+            # IMPORTANT: We always display the RAW Google Shopping listing price (not multiplied).
+            # Quantity multiplication only happens when creating Purchase Orders.
             warning = None
+            per_unit_price = price  # price per single unit for sorting
 
             if is_bundle_product:
+                per_unit_price = price
+                warning = f"\u2139\ufe0f Gift set / bundle product"
+            elif confident and detected_qty > 1:
+                per_unit_price = price / detected_qty
                 if original_quantity > 1:
-                    multiplier = original_quantity
-                    warning = f"\u26a0\ufe0f Hediye setli \u00fcr\u00fcn - {multiplier} adet al\u0131nmal\u0131"
-            elif original_quantity > 1:
-                if detected_qty < original_quantity:
-                    multiplier = math.ceil(original_quantity / detected_qty)
-                    if detected_qty == 1:
-                        warning = f"\u26a0\ufe0f Tekli sat\u0131\u015f - {multiplier} adet al\u0131nmal\u0131"
-                    else:
-                        warning = f"\u26a0\ufe0f {detected_qty}'li paket - {multiplier} paket al\u0131nmal\u0131"
-                elif detected_qty > original_quantity:
-                    warning = f"\u2139\ufe0f Pakette {detected_qty} {original_unit} var ({original_quantity} istendi)"
+                    packs_needed = math.ceil(original_quantity / detected_qty)
+                    warning = f"\u2139\ufe0f Pack of {detected_qty} — need {packs_needed} packs for {original_quantity} {original_unit}"
+                else:
+                    warning = f"\u2139\ufe0f Package has {detected_qty} {original_unit}"
+            elif not confident and original_quantity > 1:
+                warning = f"\u26a0\ufe0f {original_quantity} {original_unit} needed — check listing qty"
 
-                # Safety check for unconfident detections
-                if not confident and original_quantity > 1 and multiplier == 1:
-                    multiplier = original_quantity
-                    warning = f"\u26a0\ufe0f Tekli sat\u0131\u015f varsay\u0131ld\u0131 - {multiplier} adet al\u0131nmal\u0131"
-
-            total_price = price * multiplier
+            # total_price = raw listing price (NO multiplication)
+            total_price = price
             relevance_score = calculate_relevance_score(title, source, original_name, original_brand)
             trusted = is_trusted_store(source)
+
+            # Exact quantity match bonus
+            if confident and detected_qty == original_quantity:
+                relevance_score += 30
+
+            # Over-purchase penalty: when detected_qty is way higher than needed,
+            # it's likely a misdetection (e.g., "200 yaprak" → qty=200 for 15 packs)
+            # or an enormous bulk pack that wastes money.
+            qty_misdetected = False
+            if detected_qty > 1 and original_quantity > 1:
+                ratio = detected_qty / original_quantity
+                if ratio > 5:
+                    # Extreme mismatch: likely quantity misdetection
+                    relevance_score -= 40
+                    per_unit_price = price  # Treat as single unit (reset per_unit calc)
+                    detected_qty = 1  # Reset to single for cost calculation
+                    confident = False  # Mark as not confident
+                    qty_misdetected = True
+                    warning = f"⚠️ Qty detection unreliable — listing may be single unit"
+                elif ratio > 2:
+                    # Moderate over-purchase: penalize proportionally
+                    relevance_score -= 15
+
+            # Calculate cost_to_fulfill: actual cost to buy enough packs for the order
+            # This helps prefer singles over over-sized packs when total cost matters
+            # e.g., 4 singles at ₺60 = ₺240 is cheaper than 1x 7-pack at ₺298
+            if confident and detected_qty >= 1 and original_quantity > 0:
+                packs_needed = math.ceil(original_quantity / detected_qty)
+                cost_to_fulfill = price * packs_needed
+            else:
+                cost_to_fulfill = price * original_quantity  # Assume single unit
 
             processed_results.append({
                 'title': title,
                 'source': source,
                 'link': link,
                 'original_price': price,
+                'per_unit_price': per_unit_price,
+                'cost_to_fulfill': cost_to_fulfill,
                 'detected_qty': detected_qty,
                 'confident': confident,
                 'is_bundle': is_bundle_product,
-                'multiplier': multiplier,
+                'multiplier': 1,
                 'total_price': total_price,
                 'warning': warning,
                 'relevance_score': relevance_score,
                 'trusted': trusted,
+                'page_token': page_token,
             })
 
         # ============================================
@@ -751,17 +1236,22 @@ class TotalinePriceSearch(models.Model):
         # Filter trusted results with good relevance
         trusted_results = [
             r for r in processed_results
-            if r['trusted'] and r['relevance_score'] >= 40
+            if r['trusted'] and r['relevance_score'] >= relevance_threshold
         ]
-        # Sort: non-bundles first, then by relevance (if big diff), then by price
+        # Sort: non-bundles first → confident first → cheapest cost to fulfill order
+        # All results already passed relevance threshold + brand matching = correct products.
+        # cost_to_fulfill penalizes over-sized packs naturally (e.g., 7-pack for 4 units).
         trusted_results.sort(key=lambda r: (
-            r['is_bundle'],  # False < True, so non-bundles first
-            -(r['relevance_score'] if abs(r.get('relevance_score', 0)) > 25 else 0),
-            r['total_price'],
+            r['is_bundle'],           # False < True, so non-bundles first
+            not r['confident'],       # confident first
+            r['cost_to_fulfill'],     # cheapest total cost to fulfill order
         ))
 
-        untrusted_results = [r for r in processed_results if not r['trusted']]
-        untrusted_results.sort(key=lambda r: r['total_price'])
+        untrusted_results = [
+            r for r in processed_results
+            if not r['trusted'] and r['relevance_score'] >= relevance_threshold
+        ]
+        untrusted_results.sort(key=lambda r: r['cost_to_fulfill'])
 
         # Combine: trusted first, then untrusted
         all_sorted = trusted_results + untrusted_results
@@ -778,6 +1268,11 @@ class TotalinePriceSearch(models.Model):
             'price_3': top_3[2]['total_price'] if len(top_3) > 2 else 0,
             'store_3': top_3[2]['source'] if len(top_3) > 2 else '',
             'url_3': top_3[2]['link'] if len(top_3) > 2 else '',
+            'detected_qty_1': top_3[0]['detected_qty'] if len(top_3) > 0 else 0,
+            'detected_qty_2': top_3[1]['detected_qty'] if len(top_3) > 1 else 0,
+            'detected_qty_3': top_3[2]['detected_qty'] if len(top_3) > 2 else 0,
+            'page_token_1': top_3[0].get('page_token', '') if len(top_3) > 0 else '',
+            'best_title': top_3[0].get('title', '') if len(top_3) > 0 else '',
             'warning': '',
         }
 
@@ -789,7 +1284,7 @@ class TotalinePriceSearch(models.Model):
                 break  # Only first warning
 
         if not top_3:
-            warnings.append('Sonu\u00e7 bulunamad\u0131')  # No results found
+            warnings.append('No results found')
 
         result['warning'] = warnings[0] if warnings else ''
 
@@ -826,21 +1321,23 @@ class TotalinePriceSearch(models.Model):
 
             for line in self.search_line_ids:
                 try:
-                    # Build search query (ported from n8n Parse Products)
+                    # ================================================
+                    # STEP 1: Google Shopping search (product discovery)
+                    # ================================================
                     search_query = build_search_query(
                         product_name=line.product_name,
                         brand=line.brand,
                         description=line.description,
                         unit=line.unit,
                         quantity=line.quantity,
+                        include_quantity=True,
                     )
 
-                    _logger.info(f'Searching: "{search_query}" for product "{line.product_name}"')
+                    _logger.info(f'[Step 1] Shopping search: "{search_query}" for "{line.product_name}"')
 
-                    # Call SerpAPI directly
                     serp_results = self._search_serpapi(search_query, api_key)
 
-                    # Format results (ported from n8n Format Response V3)
+                    # Format shopping results (identifies best matching product)
                     formatted = self._format_search_results(
                         serp_results=serp_results,
                         product_name=line.product_name,
@@ -848,7 +1345,112 @@ class TotalinePriceSearch(models.Model):
                         quantity=line.quantity,
                         unit=line.unit,
                         description=line.description,
+                        relevance_threshold=40,
                     )
+
+                    # FALLBACK TIER 1: Relax relevance threshold (no extra API call)
+                    if not formatted.get('price_1'):
+                        _logger.info(f'No results at threshold=40 for "{line.product_name}", relaxing to 20')
+                        formatted = self._format_search_results(
+                            serp_results=serp_results,
+                            product_name=line.product_name,
+                            brand=line.brand,
+                            quantity=line.quantity,
+                            unit=line.unit,
+                            description=line.description,
+                            relevance_threshold=20,
+                        )
+
+                    # FALLBACK TIER 2: Simplified query (1 extra API call)
+                    if not formatted.get('price_1'):
+                        fallback_query = f"{line.product_name} {line.brand}".strip()
+                        _logger.info(f'Fallback search: "{fallback_query}" for "{line.product_name}"')
+                        serp_fallback = self._search_serpapi(fallback_query, api_key)
+                        formatted = self._format_search_results(
+                            serp_results=serp_fallback,
+                            product_name=line.product_name,
+                            brand=line.brand,
+                            quantity=line.quantity,
+                            unit=line.unit,
+                            description=line.description,
+                            relevance_threshold=20,
+                        )
+                        if formatted.get('price_1'):
+                            formatted['warning'] = (formatted.get('warning', '') + ' (fallback query)').strip()
+
+                    # ================================================
+                    # STEP 2: Immersive Product (verified store offers)
+                    # ================================================
+                    # If Step 1 found a good match with a page_token,
+                    # fetch verified store offers with real prices + shipping + direct links.
+                    # This costs 1 extra API call but gives much more reliable data.
+                    page_token = formatted.get('page_token_1', '')
+                    if page_token and formatted.get('price_1'):
+                        _logger.info(
+                            f'[Step 2] Immersive product lookup for "{line.product_name}" '
+                            f'(matched: "{formatted.get("best_title", "")[:50]}")'
+                        )
+
+                        immersive_data = self._search_serpapi_immersive(page_token, api_key)
+
+                        if immersive_data:
+                            # Use the detected quantity from Step 1's best match
+                            shopping_qty = formatted.get('detected_qty_1', 1) or 1
+
+                            immersive_formatted = self._format_immersive_results(
+                                immersive_data=immersive_data,
+                                product_name=line.product_name,
+                                brand=line.brand,
+                                quantity=line.quantity,
+                                unit=line.unit,
+                                shopping_detected_qty=shopping_qty,
+                            )
+
+                            if immersive_formatted and immersive_formatted.get('price_1'):
+                                # Immersive results are better — use them, but backfill
+                                # empty 2nd/3rd slots from shopping results
+                                shopping_backup = formatted.copy()
+                                _logger.info(
+                                    f'[Step 2] Using immersive results for "{line.product_name}": '
+                                    f'₺{immersive_formatted["price_1"]:.0f} at {immersive_formatted["store_1"]} '
+                                    f'(was ₺{formatted["price_1"]:.0f} from shopping)'
+                                )
+                                formatted = immersive_formatted
+
+                                # Backfill empty price slots from shopping results
+                                for slot in (2, 3):
+                                    if not formatted.get(f'price_{slot}') and shopping_backup.get(f'price_{slot}'):
+                                        formatted[f'price_{slot}'] = shopping_backup[f'price_{slot}']
+                                        formatted[f'store_{slot}'] = shopping_backup.get(f'store_{slot}', '')
+                                        formatted[f'url_{slot}'] = shopping_backup.get(f'url_{slot}', '')
+                                        formatted[f'detected_qty_{slot}'] = shopping_backup.get(f'detected_qty_{slot}', 0)
+                                        _logger.info(
+                                            f'[Step 2] Backfilled slot {slot} from shopping: '
+                                            f'₺{formatted[f"price_{slot}"]:.0f} at {formatted[f"store_{slot}"]}'
+                                        )
+                                # Also backfill slot 1 from shopping into empty slot 2/3
+                                # if immersive only had 1 seller and shopping had a different price
+                                if (not formatted.get('price_2')
+                                        and shopping_backup.get('price_1')
+                                        and shopping_backup['store_1'] != formatted.get('store_1', '')):
+                                    formatted['price_2'] = shopping_backup['price_1']
+                                    formatted['store_2'] = shopping_backup.get('store_1', '')
+                                    formatted['url_2'] = shopping_backup.get('url_1', '')
+                                    formatted['detected_qty_2'] = shopping_backup.get('detected_qty_1', 0)
+                                    _logger.info(
+                                        f'[Step 2] Backfilled slot 2 from shopping best: '
+                                        f'₺{formatted["price_2"]:.0f} at {formatted["store_2"]}'
+                                    )
+                            else:
+                                _logger.info(
+                                    f'[Step 2] Immersive product had no valid offers for "{line.product_name}", '
+                                    f'keeping shopping results'
+                                )
+                    elif formatted.get('price_1') and not page_token:
+                        _logger.info(
+                            f'[Step 2] No page_token available for "{line.product_name}", '
+                            f'keeping shopping results'
+                        )
 
                     # Write results to the line
                     line.write({
@@ -861,6 +1463,9 @@ class TotalinePriceSearch(models.Model):
                         'price_3': formatted.get('price_3', 0),
                         'store_3': formatted.get('store_3', ''),
                         'url_3': formatted.get('url_3', ''),
+                        'detected_qty_1': formatted.get('detected_qty_1', 0),
+                        'detected_qty_2': formatted.get('detected_qty_2', 0),
+                        'detected_qty_3': formatted.get('detected_qty_3', 0),
                         'warning': formatted.get('warning', ''),
                     })
 
@@ -870,7 +1475,7 @@ class TotalinePriceSearch(models.Model):
                     error_count += 1
                     _logger.exception(f'Failed to search product: {line.product_name}')
                     line.write({
-                        'warning': f'Arama hatas\u0131: {str(e)[:100]}',
+                        'warning': f'Search error: {str(e)[:100]}',
                     })
 
             # Save to price history
@@ -1034,6 +1639,177 @@ class TotalinePriceSearch(models.Model):
             'context': {'default_search_id': self.id},
         }
 
+    def action_export_template(self):
+        """Export a formatted Excel template for product import."""
+        if not OPENPYXL_AVAILABLE:
+            raise UserError('Excel library (openpyxl) is not installed.')
+
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+        wb = openpyxl.Workbook()
+
+        # --- Sheet 1: Products ---
+        ws = wb.active
+        ws.title = 'Products'
+
+        # Check if we have search results to include price columns
+        has_results = self.state == 'done' and any(line.price_1 > 0 for line in self.search_line_ids)
+
+        if has_results:
+            headers = [
+                'Product Name', 'Brand', 'Quantity', 'Package Qty', 'Items per Package',
+                'Unit', 'Description',
+                '1st Price', '1st Total Cost', '1st Store', '1st Store URL',
+                '2nd Price', '2nd Store',
+                '3rd Price', '3rd Store',
+                'Warning',
+            ]
+        else:
+            headers = ['Product Name', 'Brand', 'Quantity', 'Package Qty', 'Items per Package', 'Unit', 'Description']
+
+        header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+        green_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+        header_font = Font(bold=True, color='FFFFFF', size=11)
+        price_font = Font(bold=True, color='006100', size=11)
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin'),
+        )
+
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = thin_border
+
+        # Export existing products if available, otherwise show example
+        if self.search_line_ids:
+            for row_idx, line in enumerate(self.search_line_ids, 2):
+                row_data = [
+                    line.product_name or '',
+                    line.brand or '',
+                    line.total_quantity or line.quantity or 1,
+                    line.package_quantity or 1,
+                    line.items_per_package or 1,
+                    line.unit or '',
+                    line.description or '',
+                ]
+
+                if has_results:
+                    row_data.extend([
+                        line.price_1 or 0,
+                        line.total_cost_1 or 0,
+                        line.store_1 or '',
+                        line.url_1 or '',
+                        line.price_2 or 0,
+                        line.store_2 or '',
+                        line.price_3 or 0,
+                        line.store_3 or '',
+                        line.warning or '',
+                    ])
+
+                for col_idx, val in enumerate(row_data, 1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=val)
+                    cell.border = thin_border
+
+                # Highlight price columns with green
+                if has_results:
+                    for price_col in [8, 9]:  # 1st Price, Total Cost
+                        cell = ws.cell(row=row_idx, column=price_col)
+                        cell.fill = green_fill
+                        cell.font = price_font
+                        cell.number_format = '#,##0.00'
+        else:
+            example = ['Turkish Coffee 100g', 'Kurukahveci Mehmet Efendi', 12, 3, 4, 'adet', '100gr pack']
+            for col_idx, val in enumerate(example, 1):
+                cell = ws.cell(row=2, column=col_idx, value=val)
+                cell.border = thin_border
+                cell.font = Font(italic=True, color='808080')
+
+        # Add totals row if we have results
+        if has_results and self.search_line_ids:
+            total_row = len(self.search_line_ids) + 2
+            ws.cell(row=total_row, column=7, value='TOTAL').font = Font(bold=True, size=12)
+            ws.cell(row=total_row, column=7).border = thin_border
+            total_cell = ws.cell(row=total_row, column=9,
+                                 value=sum(line.total_cost_1 or 0 for line in self.search_line_ids))
+            total_cell.font = Font(bold=True, color='006100', size=12)
+            total_cell.fill = green_fill
+            total_cell.number_format = '#,##0.00'
+            total_cell.border = thin_border
+
+        # Column widths
+        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['B'].width = 30
+        ws.column_dimensions['C'].width = 12
+        ws.column_dimensions['D'].width = 14
+        ws.column_dimensions['E'].width = 18
+        ws.column_dimensions['F'].width = 12
+        ws.column_dimensions['G'].width = 35
+        if has_results:
+            ws.column_dimensions['H'].width = 14  # 1st Price
+            ws.column_dimensions['I'].width = 16  # Total Cost
+            ws.column_dimensions['J'].width = 22  # 1st Store
+            ws.column_dimensions['K'].width = 50  # URL
+            ws.column_dimensions['L'].width = 14  # 2nd Price
+            ws.column_dimensions['M'].width = 22  # 2nd Store
+            ws.column_dimensions['N'].width = 14  # 3rd Price
+            ws.column_dimensions['O'].width = 22  # 3rd Store
+            ws.column_dimensions['P'].width = 40  # Warning
+
+        # --- Sheet 2: Instructions ---
+        ws2 = wb.create_sheet('Instructions')
+        instructions = [
+            ['Column', 'Required', 'Description', 'Example'],
+            ['Product Name', 'Yes', 'Name of the product to search for', 'Turkish Coffee 100g'],
+            ['Brand', 'No', 'Brand name (improves search accuracy)', 'Kurukahveci Mehmet Efendi'],
+            ['Quantity', 'No', 'Total units needed (default: 1). Auto-calculated if Package Qty and Items per Package are provided.', '12'],
+            ['Package Qty', 'No', 'Number of packages to order (default: 1)', '3'],
+            ['Items per Package', 'No', 'Units per package (default: 1). Total = Package Qty x Items per Package.', '4'],
+            ['Unit', 'No', 'Unit type: adet, kg, litre, paket, koli', 'adet'],
+            ['Description', 'No', 'Additional details (size, variant, etc.)', '100gr pack'],
+        ]
+
+        for row_idx, row_data in enumerate(instructions, 1):
+            for col_idx, val in enumerate(row_data, 1):
+                cell = ws2.cell(row=row_idx, column=col_idx, value=val)
+                cell.border = thin_border
+                if row_idx == 1:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = Alignment(horizontal='center')
+
+        ws2.column_dimensions['A'].width = 20
+        ws2.column_dimensions['B'].width = 12
+        ws2.column_dimensions['C'].width = 50
+        ws2.column_dimensions['D'].width = 30
+
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        file_data = base64.b64encode(output.getvalue())
+        output.close()
+
+        # Create attachment
+        attachment = self.env['ir.attachment'].create({
+            'name': 'product_import_template.xlsx',
+            'type': 'binary',
+            'datas': file_data,
+            'mimetype': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'res_model': self._name,
+            'res_id': self.id,
+        })
+
+        return {
+            'type': 'ir.actions.act_url',
+            'url': f'/web/content/{attachment.id}?download=true',
+            'target': 'new',
+        }
+
     def action_create_purchase_order(self):
         """Create purchase order from selected prices"""
         self.ensure_one()
@@ -1081,10 +1857,10 @@ class TotalinePriceSearch(models.Model):
                     })
 
             # Get selected price, store, and URL
-            selected_price = line.selected_price_value
+            selected_price = line.selected_price_value  # Raw listing price from Google
             selected_store = line.selected_store_value
             selected_url = line.selected_url_value
-            qty = line.quantity or 1
+            qty = line.total_quantity or line.quantity or 1
 
             # Build description
             description = f"{line.product_name}"
@@ -1098,15 +1874,16 @@ class TotalinePriceSearch(models.Model):
             if line.warning:
                 description += f"\nNote: {line.warning}"
 
+            # Price per unit = listing price (it's the raw Google Shopping price per listing)
             po_lines.append((0, 0, {
                 'product_id': product.id,
                 'name': description,
                 'product_qty': qty,
-                'price_unit': selected_price / qty if qty else selected_price,
+                'price_unit': selected_price,
                 'date_planned': fields.Datetime.now(),
             }))
 
-            total_selected += selected_price
+            total_selected += selected_price * qty
             notes.append(f"\u2022 {line.product_name}: \u20ba{selected_price:,.2f} from {selected_store} (Price {line.selected_price})")
 
         # Create the Purchase Order
@@ -1171,34 +1948,56 @@ class TotalinePriceSearchLine(models.Model):
     unit = fields.Char(string='Unit')
     description = fields.Char(string='Description')
 
+    # Package / Unit breakdown
+    package_quantity = fields.Float(string='Package Qty', default=1,
+                                     help='Number of packages to order')
+    items_per_package = fields.Float(string='Items/Pkg', default=1,
+                                      help='Number of units per package')
+    total_quantity = fields.Float(string='Total Qty', compute='_compute_total_quantity',
+                                   store=True, help='package_quantity x items_per_package')
+
+    # Detected quantities from search results (readonly)
+    detected_qty_1 = fields.Float(string='Detected Qty 1', readonly=True)
+    detected_qty_2 = fields.Float(string='Detected Qty 2', readonly=True)
+    detected_qty_3 = fields.Float(string='Detected Qty 3', readonly=True)
+
+    # Optimization suggestions (readonly)
+    suggested_package_qty = fields.Float(string='Suggested Pkg Qty', readonly=True)
+    suggested_items_per_pkg = fields.Float(string='Suggested Items/Pkg', readonly=True)
+    suggested_total_price = fields.Float(string='Suggested Total Price', readonly=True)
+    optimization_note = fields.Char(string='Optimization Note', readonly=True)
+
     # Link to existing Odoo product (optional)
     product_id = fields.Many2one('product.product', string='Odoo Product',
                                   help='Link to existing product in Odoo. Leave empty to create new.')
 
     # Price Selection for PO
     selected_price = fields.Selection([
-        ('1', '1. Fiyat (En \u0130yi)'),
-        ('2', '2. Fiyat'),
-        ('3', '3. Fiyat'),
-    ], string='Se\u00e7ilen Fiyat', default='1', help='Select which price to use for Purchase Order')
+        ('1', '1st Price (Best)'),
+        ('2', '2nd Price'),
+        ('3', '3rd Price'),
+    ], string='Selected Price', default='1', help='Select which price to use for Purchase Order')
 
     # Price Results
     price_1 = fields.Float(string='1st Price')
-    store_1 = fields.Char(string='1st Store')
+    store_1 = fields.Char(string='1st Store Name')
     url_1 = fields.Char(string='1st URL')
-    store_link_1 = fields.Html(string='1. Store', compute='_compute_store_links', sanitize=False)
+    store_link_1 = fields.Html(string='1st Store', compute='_compute_store_links', sanitize=False)
 
     price_2 = fields.Float(string='2nd Price')
-    store_2 = fields.Char(string='2nd Store')
+    store_2 = fields.Char(string='2nd Store Name')
     url_2 = fields.Char(string='2nd URL')
-    store_link_2 = fields.Html(string='2. Store', compute='_compute_store_links', sanitize=False)
+    store_link_2 = fields.Html(string='2nd Store', compute='_compute_store_links', sanitize=False)
 
     price_3 = fields.Float(string='3rd Price')
-    store_3 = fields.Char(string='3rd Store')
+    store_3 = fields.Char(string='3rd Store Name')
     url_3 = fields.Char(string='3rd URL')
-    store_link_3 = fields.Html(string='3. Store', compute='_compute_store_links', sanitize=False)
+    store_link_3 = fields.Html(string='3rd Store', compute='_compute_store_links', sanitize=False)
 
-    # Calculated
+    # Calculated: Total cost to fulfill order (listing price × packs needed)
+    total_cost_1 = fields.Float(string='Total Cost', compute='_compute_total_costs', store=True)
+    total_cost_2 = fields.Float(string='2nd Total Cost', compute='_compute_total_costs', store=True)
+    total_cost_3 = fields.Float(string='3rd Total Cost', compute='_compute_total_costs', store=True)
     price_diff_percent = fields.Float(string='% Diff', compute='_compute_price_diff')
     warning = fields.Char(string='Warning')
 
@@ -1209,6 +2008,113 @@ class TotalinePriceSearchLine(models.Model):
 
     # Price history link
     history_count = fields.Integer(string='History Count', compute='_compute_history_count')
+
+    @api.depends('package_quantity', 'items_per_package', 'quantity')
+    def _compute_total_quantity(self):
+        for line in self:
+            pkg = line.package_quantity or 1
+            items = line.items_per_package or 1
+            computed = pkg * items
+            # If package fields are default (1×1=1) but legacy quantity > 1, use that
+            if computed == 1 and (line.quantity or 0) > 1:
+                line.total_quantity = line.quantity
+            else:
+                line.total_quantity = computed
+
+    @api.depends('price_1', 'price_2', 'price_3',
+                 'detected_qty_1', 'detected_qty_2', 'detected_qty_3',
+                 'total_quantity', 'quantity', 'description')
+    def _compute_total_costs(self):
+        """Calculate total cost to fulfill the order for each price option.
+        total_cost = listing_price × ceil(order_qty / detected_pack_qty)
+        e.g. Pril ₺69 × 4 packs = ₺276, Türk Kahvesi ₺499 × 5 packs = ₺2,495
+
+        Special case: when description specifies pack contents (e.g. "8li" = 8 items
+        per pack) AND detected_qty matches that number, it means the listing IS one
+        package. In that case, order_qty represents number of packages, not items.
+        e.g. Rulo Peçete: desc="8li", detected=8, qty=15 → 15 packs × ₺153 = ₺2,295
+        """
+        for line in self:
+            target_qty = line.total_quantity or line.quantity or 1
+
+            # Check if description specifies items-per-package (e.g. "8li")
+            desc_items_per_pkg = extract_items_per_pkg(line.description) if line.description else 0
+
+            for i in range(1, 4):
+                price = getattr(line, f'price_{i}', 0) or 0
+                detected = getattr(line, f'detected_qty_{i}', 0) or 1
+
+                if price > 0 and target_qty > 0:
+                    # When detected_qty matches the description's pack-contents indicator
+                    # (e.g. both = 8) AND it's different from order quantity, the listing
+                    # IS one package and the order quantity represents package count.
+                    if (desc_items_per_pkg > 1
+                            and detected == desc_items_per_pkg
+                            and desc_items_per_pkg != target_qty):
+                        # Each listing = 1 package → need target_qty of them
+                        packs_needed = int(target_qty)
+                    else:
+                        packs_needed = math.ceil(target_qty / max(detected, 1))
+
+                    setattr(line, f'total_cost_{i}', price * packs_needed)
+                else:
+                    setattr(line, f'total_cost_{i}', 0)
+
+    @api.onchange('package_quantity', 'items_per_package')
+    def _onchange_package_items(self):
+        """Sync legacy quantity field with total_quantity for backwards compatibility."""
+        self.quantity = (self.package_quantity or 1) * (self.items_per_package or 1)
+
+    def action_suggest_optimization(self):
+        """Analyze search results and suggest optimal package/unit combination."""
+        self.ensure_one()
+        target_qty = self.total_quantity or self.quantity or 1
+        if target_qty <= 1:
+            self.optimization_note = 'No optimization needed for single unit.'
+            return
+
+        # Collect all detected quantities and prices from results
+        options = []
+        for i in range(1, 4):
+            price = getattr(self, f'price_{i}', 0)
+            detected = getattr(self, f'detected_qty_{i}', 0) or 1
+            if price and price > 0:
+                per_unit = price / detected if detected > 0 else price
+                packs_needed = math.ceil(target_qty / detected)
+                total_cost = price * packs_needed
+                options.append({
+                    'price_num': i,
+                    'detected_qty': detected,
+                    'per_unit': per_unit,
+                    'packs_needed': packs_needed,
+                    'total_cost': total_cost,
+                })
+
+        if not options:
+            self.optimization_note = 'No price data available to optimize.'
+            return
+
+        # Find cheapest option
+        best = min(options, key=lambda o: o['total_cost'])
+        current_cost = self.selected_price_value or 0
+
+        self.suggested_package_qty = best['packs_needed']
+        self.suggested_items_per_pkg = best['detected_qty']
+        self.suggested_total_price = best['total_cost']
+
+        savings = current_cost - best['total_cost'] if current_cost > 0 else 0
+        if savings > 0:
+            self.optimization_note = (
+                f"Best: {best['packs_needed']}x packs of {int(best['detected_qty'])} "
+                f"(Price {best['price_num']}) = {best['total_cost']:.2f} TL "
+                f"(save {savings:.2f} TL)"
+            )
+        else:
+            self.optimization_note = (
+                f"Current selection is optimal. "
+                f"Best found: {best['packs_needed']}x packs of {int(best['detected_qty'])} "
+                f"= {best['total_cost']:.2f} TL"
+            )
 
     def _compute_history_count(self):
         PriceHistory = self.env['totaline.price.history']
