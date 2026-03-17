@@ -9,6 +9,7 @@ import math
 import base64
 import logging
 from difflib import SequenceMatcher
+from markupsafe import escape as html_escape
 import io
 
 _logger = logging.getLogger(__name__)
@@ -1510,6 +1511,7 @@ class TotalinePriceSearch(models.Model):
                     'brand': line.brand,
                     'quantity': line.quantity,
                     'unit': line.unit,
+                    'detected_qty_1': line.detected_qty_1,
                     'price_1': line.price_1,
                     'store_1': line.store_1,
                     'url_1': line.url_1,
@@ -1860,7 +1862,10 @@ class TotalinePriceSearch(models.Model):
             selected_price = line.selected_price_value  # Raw listing price from Google
             selected_store = line.selected_store_value
             selected_url = line.selected_url_value
-            qty = line.total_quantity or line.quantity or 1
+
+            # Use shared pack-conversion logic for accurate PO quantities
+            selected_detected = getattr(line, f'detected_qty_{line.selected_price[-1]}', 0) or 1
+            packs_needed = line._get_packs_needed(selected_detected)
 
             # Build description
             description = f"{line.product_name}"
@@ -1874,16 +1879,16 @@ class TotalinePriceSearch(models.Model):
             if line.warning:
                 description += f"\nNote: {line.warning}"
 
-            # Price per unit = listing price (it's the raw Google Shopping price per listing)
+            # PO line: quantity = packs needed, price = listing price per pack
             po_lines.append((0, 0, {
                 'product_id': product.id,
                 'name': description,
-                'product_qty': qty,
+                'product_qty': packs_needed,
                 'price_unit': selected_price,
                 'date_planned': fields.Datetime.now(),
             }))
 
-            total_selected += selected_price * qty
+            total_selected += selected_price * packs_needed
             notes.append(f"\u2022 {line.product_name}: \u20ba{selected_price:,.2f} from {selected_store} (Price {line.selected_price})")
 
         # Create the Purchase Order
@@ -2021,41 +2026,45 @@ class TotalinePriceSearchLine(models.Model):
             else:
                 line.total_quantity = computed
 
+    def _get_packs_needed(self, detected_qty):
+        """Shared pack-conversion logic used by total cost computation AND PO creation.
+
+        Returns the number of listings (packs) needed to fulfill this line's order.
+
+        Special case: when description specifies pack contents (e.g. "8li" = 8 items
+        per pack) AND detected_qty matches that number, it means the listing IS one
+        package. In that case, order_qty represents number of packages, not items.
+        e.g. Rulo Peçete: desc="8li", detected=8, qty=15 → 15 packs needed
+        """
+        self.ensure_one()
+        target_qty = self.total_quantity or self.quantity or 1
+        detected = detected_qty or 1
+
+        desc_items_per_pkg = extract_items_per_pkg(self.description) if self.description else 0
+
+        if (desc_items_per_pkg > 1
+                and detected == desc_items_per_pkg
+                and desc_items_per_pkg != target_qty):
+            # Each listing = 1 package → need target_qty of them
+            return int(target_qty)
+        else:
+            return math.ceil(target_qty / max(detected, 1))
+
     @api.depends('price_1', 'price_2', 'price_3',
                  'detected_qty_1', 'detected_qty_2', 'detected_qty_3',
                  'total_quantity', 'quantity', 'description')
     def _compute_total_costs(self):
         """Calculate total cost to fulfill the order for each price option.
-        total_cost = listing_price × ceil(order_qty / detected_pack_qty)
+        total_cost = listing_price × packs_needed
         e.g. Pril ₺69 × 4 packs = ₺276, Türk Kahvesi ₺499 × 5 packs = ₺2,495
-
-        Special case: when description specifies pack contents (e.g. "8li" = 8 items
-        per pack) AND detected_qty matches that number, it means the listing IS one
-        package. In that case, order_qty represents number of packages, not items.
-        e.g. Rulo Peçete: desc="8li", detected=8, qty=15 → 15 packs × ₺153 = ₺2,295
         """
         for line in self:
-            target_qty = line.total_quantity or line.quantity or 1
-
-            # Check if description specifies items-per-package (e.g. "8li")
-            desc_items_per_pkg = extract_items_per_pkg(line.description) if line.description else 0
-
             for i in range(1, 4):
                 price = getattr(line, f'price_{i}', 0) or 0
                 detected = getattr(line, f'detected_qty_{i}', 0) or 1
 
-                if price > 0 and target_qty > 0:
-                    # When detected_qty matches the description's pack-contents indicator
-                    # (e.g. both = 8) AND it's different from order quantity, the listing
-                    # IS one package and the order quantity represents package count.
-                    if (desc_items_per_pkg > 1
-                            and detected == desc_items_per_pkg
-                            and desc_items_per_pkg != target_qty):
-                        # Each listing = 1 package → need target_qty of them
-                        packs_needed = int(target_qty)
-                    else:
-                        packs_needed = math.ceil(target_qty / max(detected, 1))
-
+                if price > 0:
+                    packs_needed = line._get_packs_needed(detected)
                     setattr(line, f'total_cost_{i}', price * packs_needed)
                 else:
                     setattr(line, f'total_cost_{i}', 0)
@@ -2152,23 +2161,17 @@ class TotalinePriceSearchLine(models.Model):
     @api.depends('store_1', 'url_1', 'store_2', 'url_2', 'store_3', 'url_3')
     def _compute_store_links(self):
         for line in self:
-            # Store 1
-            if line.url_1 and line.store_1:
-                line.store_link_1 = f'<a href="{line.url_1}" target="_blank">{line.store_1} \u2197</a>'
-            else:
-                line.store_link_1 = line.store_1 or ''
-
-            # Store 2
-            if line.url_2 and line.store_2:
-                line.store_link_2 = f'<a href="{line.url_2}" target="_blank">{line.store_2} \u2197</a>'
-            else:
-                line.store_link_2 = line.store_2 or ''
-
-            # Store 3
-            if line.url_3 and line.store_3:
-                line.store_link_3 = f'<a href="{line.url_3}" target="_blank">{line.store_3} \u2197</a>'
-            else:
-                line.store_link_3 = line.store_3 or ''
+            for i in range(1, 4):
+                url = getattr(line, f'url_{i}', '') or ''
+                store = getattr(line, f'store_{i}', '') or ''
+                if url and store:
+                    # Escape external data (from SerpAPI) to prevent stored XSS
+                    safe_store = html_escape(store)
+                    safe_url = html_escape(url)
+                    setattr(line, f'store_link_{i}',
+                            f'<a href="{safe_url}" target="_blank">{safe_store} \u2197</a>')
+                else:
+                    setattr(line, f'store_link_{i}', html_escape(store) if store else '')
 
     @api.depends('price_1', 'price_2')
     def _compute_price_diff(self):
@@ -2202,16 +2205,23 @@ class TotalinePriceHistory(models.Model):
     price_3 = fields.Float(string='3rd Price')
     store_3 = fields.Char(string='3rd Store')
 
+    # Pack detection (for accurate per-item analytics)
+    detected_qty_1 = fields.Float(string='Detected Qty',
+                                   help='Number of items per listing (from product title)')
+
     # Timing
     search_date = fields.Datetime(string='Search Date', required=True, index=True)
 
     # Computed for analytics
-    price_per_unit = fields.Float(string='Price/Unit', compute='_compute_price_per_unit', store=True)
+    price_per_unit = fields.Float(string='Price/Item', compute='_compute_price_per_unit', store=True)
 
-    @api.depends('price_1', 'quantity')
+    @api.depends('price_1', 'detected_qty_1')
     def _compute_price_per_unit(self):
+        """True per-item price: listing price / items in listing.
+        e.g. 8-pack of paper towels at 153 TL → 153/8 = 19.13 TL per roll.
+        """
         for record in self:
-            if record.quantity and record.price_1:
-                record.price_per_unit = record.price_1 / record.quantity
+            if record.price_1 and record.detected_qty_1 and record.detected_qty_1 > 0:
+                record.price_per_unit = record.price_1 / record.detected_qty_1
             else:
                 record.price_per_unit = record.price_1 or 0
