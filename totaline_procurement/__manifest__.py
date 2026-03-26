@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Totaline Procurement',
-    'version': '18.0.6.0.0',
+    'version': '18.0.3.0.0',
     'category': 'Purchase',
     'summary': 'Price Comparison Tool for Procurement',
     'description': """
